@@ -1,22 +1,34 @@
-import os, asyncio
+# main.py — FastAPI Instagram comments webhook (read-only)
+# - Verifies Meta Webhooks challenge
+# - Receives "comments" events
+# - Mints a Page token from your long-lived user token
+# - Fetches comment details + media permalink
+# - Logs username/text to server logs
+# - Exposes /instagram/last to peek recent events
+
+import os, asyncio, json
+from collections import deque
 from typing import Any, Dict, List
+
 from fastapi import FastAPI, Request, HTTPException, Query
 import httpx
 
 app = FastAPI()
 
-# --- ENV ---
+# ===== ENV =====
 VERIFY_TOKEN       = os.getenv("VERIFY_TOKEN", "set-a-verify-token")
 FB_GRAPH_VERSION   = os.getenv("FB_GRAPH_VERSION", "v24.0")
 FB_GRAPH           = f"https://graph.facebook.com/{FB_GRAPH_VERSION}"
-FB_LL_USER_TOKEN   = os.getenv("FB_LL_USER_ACCESS_TOKEN")  # your 60-day token
+FB_LL_USER_TOKEN   = os.getenv("FB_LL_USER_ACCESS_TOKEN")  # your 60-day user token
 FB_PAGE_ID         = os.getenv("FB_PAGE_ID", "305423772513")  # JCW page id
 
 if not FB_LL_USER_TOKEN:
-    # Better to fail early so you notice in logs
     print("WARN: FB_LL_USER_ACCESS_TOKEN not set. Mint a long-lived user token and set it in env.")
 
-# --- Helpers ---
+# Keep last N processed comments in memory for quick inspection
+RECENT = deque(maxlen=20)
+
+# ===== Helpers =====
 async def mint_page_token() -> str:
     """Derive a Page token from the (long-lived) user token."""
     if not FB_LL_USER_TOKEN:
@@ -34,6 +46,7 @@ async def mint_page_token() -> str:
         return token
 
 async def get_comment_detail(comment_id: str, page_token: str) -> Dict[str, Any]:
+    """Fetch human-friendly comment fields (text, username, timestamp, media id)."""
     fields = "id,text,username,timestamp,like_count,media"
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.get(
@@ -52,19 +65,24 @@ async def get_media_permalink(media_id: str, page_token: str) -> str:
         r.raise_for_status()
         return r.json().get("permalink", "")
 
-# --- Webhook verify (GET) ---
+# ===== Health check =====
+@app.get("/healthz")
+async def healthz():
+    return {"ok": True}
+
+# ===== Webhook verify (GET) =====
 @app.get("/instagram/webhook")
 async def verify(
     hub_mode: str = Query("", alias="hub.mode"),
     hub_verify_token: str = Query("", alias="hub.verify_token"),
     hub_challenge: str = Query("", alias="hub.challenge"),
 ):
-    # Meta calls this when you click "Verify and Save"
+    # Meta calls this when you click "Verify and Save" in the App Dashboard
     if hub_mode == "subscribe" and hub_verify_token == VERIFY_TOKEN:
         return hub_challenge
     raise HTTPException(status_code=403, detail="Invalid verification token")
 
-# --- Webhook receive (POST) ---
+# ===== Webhook receive (POST) =====
 @app.post("/instagram/webhook")
 async def receive(request: Request):
     """
@@ -72,13 +90,15 @@ async def receive(request: Request):
       - parse 'comments' changes
       - mint Page token
       - fetch full comment detail + media permalink
-      - return them in response (so you can see it immediately in logs/response)
+      - log username/text to server logs
+      - return enriched data in the response (useful for Meta 'Send Test')
     """
     body = await request.json()
     entries: List[Dict[str, Any]] = body.get("entry", [])
     if not entries:
         return {"status": "ok", "received": False}
 
+    # Mint Page token once per request
     page_token = await mint_page_token()
 
     enriched: List[Dict[str, Any]] = []
@@ -87,10 +107,11 @@ async def receive(request: Request):
         comment_id = val.get("id")
         if not comment_id:
             return
+        # Fetch comment details
         c = await get_comment_detail(comment_id, page_token)
         media_id = (c.get("media") or {}).get("id") or val.get("media_id")
         permalink = await get_media_permalink(media_id, page_token) if media_id else ""
-        enriched.append({
+        enriched_item = {
             "comment_id": c.get("id"),
             "text": c.get("text"),
             "username": c.get("username"),
@@ -98,7 +119,12 @@ async def receive(request: Request):
             "like_count": c.get("like_count"),
             "media_id": media_id,
             "permalink": permalink,
-        })
+        }
+        enriched.append(enriched_item)
+        # Log to server logs (Render → Logs)
+        print("IG COMMENT:", json.dumps(enriched_item, ensure_ascii=False))
+        # Save in-memory for quick viewing
+        RECENT.append(enriched_item)
 
     tasks = []
     for e in entries:
@@ -110,3 +136,8 @@ async def receive(request: Request):
         await asyncio.gather(*tasks, return_exceptions=True)
 
     return {"status": "ok", "count": len(enriched), "comments": enriched}
+
+# ===== Quick viewer for recent events =====
+@app.get("/instagram/last")
+async def last():
+    return {"count": len(RECENT), "comments": list(RECENT)}
