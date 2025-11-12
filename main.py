@@ -1,7 +1,6 @@
-import os
-import asyncio
+import os, asyncio
 from typing import Any, Dict, List
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Query
 import httpx
 
 app = FastAPI()
@@ -14,12 +13,14 @@ FB_LL_USER_TOKEN   = os.getenv("FB_LL_USER_ACCESS_TOKEN")  # your 60-day token
 FB_PAGE_ID         = os.getenv("FB_PAGE_ID", "305423772513")  # JCW page id
 
 if not FB_LL_USER_TOKEN:
-    # You can temporarily use a short-lived user token to test, but LL is recommended.
-    print("WARN: FB_LL_USER_ACCESS_TOKEN not set. Use a valid user token in env.")
+    # Better to fail early so you notice in logs
+    print("WARN: FB_LL_USER_ACCESS_TOKEN not set. Mint a long-lived user token and set it in env.")
 
 # --- Helpers ---
 async def mint_page_token() -> str:
     """Derive a Page token from the (long-lived) user token."""
+    if not FB_LL_USER_TOKEN:
+        raise RuntimeError("FB_LL_USER_ACCESS_TOKEN is missing.")
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.get(
             f"{FB_GRAPH}/{FB_PAGE_ID}",
@@ -33,7 +34,6 @@ async def mint_page_token() -> str:
         return token
 
 async def get_comment_detail(comment_id: str, page_token: str) -> Dict[str, Any]:
-    """Pull human-friendly comment details."""
     fields = "id,text,username,timestamp,like_count,media"
     async with httpx.AsyncClient(timeout=15) as client:
         r = await client.get(
@@ -54,8 +54,12 @@ async def get_media_permalink(media_id: str, page_token: str) -> str:
 
 # --- Webhook verify (GET) ---
 @app.get("/instagram/webhook")
-async def verify(hub_mode: str = "", hub_verify_token: str = "", hub_challenge: str = ""):
-    # Meta calls this once when you click "Verify and Save"
+async def verify(
+    hub_mode: str = Query("", alias="hub.mode"),
+    hub_verify_token: str = Query("", alias="hub.verify_token"),
+    hub_challenge: str = Query("", alias="hub.challenge"),
+):
+    # Meta calls this when you click "Verify and Save"
     if hub_mode == "subscribe" and hub_verify_token == VERIFY_TOKEN:
         return hub_challenge
     raise HTTPException(status_code=403, detail="Invalid verification token")
@@ -75,7 +79,6 @@ async def receive(request: Request):
     if not entries:
         return {"status": "ok", "received": False}
 
-    # Page token (once per request)
     page_token = await mint_page_token()
 
     enriched: List[Dict[str, Any]] = []
@@ -106,5 +109,4 @@ async def receive(request: Request):
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Respond quickly with what we enriched (great for testing)
     return {"status": "ok", "count": len(enriched), "comments": enriched}
