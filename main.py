@@ -9,6 +9,8 @@
 import os, asyncio, json
 from collections import deque
 from typing import Any, Dict, List
+from fastapi.responses import PlainTextResponse  # add this import
+
 
 from fastapi import FastAPI, Request, HTTPException, Query
 import httpx
@@ -64,6 +66,19 @@ async def get_media_permalink(media_id: str, page_token: str) -> str:
         )
         r.raise_for_status()
         return r.json().get("permalink", "")
+
+
+# ===== Webhook verify (GET) =====
+@app.get("/instagram/webhook")
+async def verify(
+    hub_mode: str = Query("", alias="hub.mode"),
+    hub_verify_token: str = Query("", alias="hub.verify_token"),
+    hub_challenge: str = Query("", alias="hub.challenge"),
+):
+    if hub_mode == "subscribe" and hub_verify_token == VERIFY_TOKEN:
+        return PlainTextResponse(hub_challenge)   # <-- return plain text
+    raise HTTPException(status_code=403, detail="Invalid verification token")
+
 
 # ===== Health check =====
 @app.get("/healthz")
