@@ -77,50 +77,59 @@ async def verify(
     raise HTTPException(status_code=403, detail="Invalid verification token")
 
 # ===== Webhook receive (POST) =====
+
+
 @app.post("/instagram/webhook")
 async def receive(request: Request):
-    """
-    Handles Instagram webhooks:
-      - Logs raw payload (so Meta 'Test' shows in logs)
-      - For dashboard test payloads (username='test'): logs without enrichment
-      - For real events: mints page token and enriches via Graph
-    """
     body = await request.json()
     print("WEBHOOK RAW:", json.dumps(body, ensure_ascii=False))
 
-    entries: List[Dict[str, Any]] = body.get("entry", [])
-    if not entries:
-        return {"status": "ok", "received": False}
+    changes = []
 
-    enriched: List[Dict[str, Any]] = []
+    # Shape A: {"object":"instagram","entry":[{"changes":[{...}]}]}
+    if isinstance(body, dict) and "entry" in body:
+        for e in body.get("entry", []):
+            for ch in e.get("changes", []):
+                changes.append(ch)
 
-    async def handle_change(val: Dict[str, Any]):
+    # Shape B: {"field":"comments","value":{...}}  (dashboard test)
+    elif isinstance(body, dict) and "field" in body and "value" in body:
+        changes.append({"field": body.get("field"), "value": body.get("value")})
+
+    if not changes:
+        return {"status": "ok", "received": False, "reason": "no changes"}
+
+    enriched = []
+
+    async def handle_change(ch: Dict[str, Any]):
         try:
-            # Dashboard "Send to server" uses fake ids/usernames (username=='test')
+            if ch.get("field") != "comments":
+                return
+            val = ch.get("value", {}) or {}
+
+            # Dashboard test payload → skip Graph calls
             frm = val.get("from") or {}
             if frm.get("username") == "test":
                 item = {
                     "test_event": True,
-                    "field": "comments",
                     "text": val.get("text"),
                     "from_id": frm.get("id"),
                     "media_id": (val.get("media") or {}).get("id"),
+                    "fake_comment_id": val.get("id"),
                 }
                 print("IG COMMENT (TEST):", json.dumps(item, ensure_ascii=False))
+                RECENT.append(item)
                 enriched.append(item)
                 return
 
-            # Real event → enrich with Graph
+            # Real event → enrich
             page_token = await mint_page_token()
-
             comment_id = val.get("id")
             if not comment_id:
                 return
-
             c = await get_comment_detail(comment_id, page_token)
             media_id = (c.get("media") or {}).get("id") or val.get("media_id")
             permalink = await get_media_permalink(media_id, page_token) if media_id else ""
-
             item = {
                 "comment_id": c.get("id"),
                 "text": c.get("text"),
@@ -131,23 +140,15 @@ async def receive(request: Request):
                 "permalink": permalink,
             }
             print("IG COMMENT:", json.dumps(item, ensure_ascii=False))
-            enriched.append(item)
             RECENT.append(item)
+            enriched.append(item)
 
         except Exception:
-            # make failures visible in Render logs
             print("ERR handle_change:", traceback.format_exc())
 
-    tasks = []
-    for e in entries:
-        for ch in e.get("changes", []):
-            if ch.get("field") == "comments":
-                tasks.append(handle_change(ch.get("value", {})))
-
-    if tasks:
-        await asyncio.gather(*tasks, return_exceptions=True)
-
+    await asyncio.gather(*(handle_change(ch) for ch in changes), return_exceptions=True)
     return {"status": "ok", "count": len(enriched), "comments": enriched}
+
 
 
 # ===== Quick viewer for recent events =====
