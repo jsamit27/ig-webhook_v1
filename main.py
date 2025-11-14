@@ -4,6 +4,9 @@ import os, asyncio, json
 from collections import deque
 from typing import Any, Dict, List
 
+import traceback
+
+
 from fastapi import FastAPI, Request, HTTPException, Query
 from fastapi.responses import PlainTextResponse
 import httpx
@@ -77,46 +80,63 @@ async def verify(
 @app.post("/instagram/webhook")
 async def receive(request: Request):
     """
-    Receive Instagram webhooks. We:
-      - parse 'comments' changes
-      - mint Page token
-      - fetch full comment detail + media permalink
-      - log username/text to server logs
-      - return enriched data in the response (useful for Meta 'Send Test')
+    Handles Instagram webhooks:
+      - Logs raw payload (so Meta 'Test' shows in logs)
+      - For dashboard test payloads (username='test'): logs without enrichment
+      - For real events: mints page token and enriches via Graph
     """
     body = await request.json()
-
-    # 👇 ADD THIS LINE to always see inbound payloads in Render logs
     print("WEBHOOK RAW:", json.dumps(body, ensure_ascii=False))
 
     entries: List[Dict[str, Any]] = body.get("entry", [])
     if not entries:
         return {"status": "ok", "received": False}
 
-    # Mint Page token once per request
-    page_token = await mint_page_token()
-
     enriched: List[Dict[str, Any]] = []
 
     async def handle_change(val: Dict[str, Any]):
-        comment_id = val.get("id")
-        if not comment_id:
-            return
-        c = await get_comment_detail(comment_id, page_token)
-        media_id = (c.get("media") or {}).get("id") or val.get("media_id")
-        permalink = await get_media_permalink(media_id, page_token) if media_id else ""
-        enriched_item = {
-            "comment_id": c.get("id"),
-            "text": c.get("text"),
-            "username": c.get("username"),
-            "timestamp": c.get("timestamp"),
-            "like_count": c.get("like_count"),
-            "media_id": media_id,
-            "permalink": permalink,
-        }
-        enriched.append(enriched_item)
-        print("IG COMMENT:", json.dumps(enriched_item, ensure_ascii=False))
-        RECENT.append(enriched_item)
+        try:
+            # Dashboard "Send to server" uses fake ids/usernames (username=='test')
+            frm = val.get("from") or {}
+            if frm.get("username") == "test":
+                item = {
+                    "test_event": True,
+                    "field": "comments",
+                    "text": val.get("text"),
+                    "from_id": frm.get("id"),
+                    "media_id": (val.get("media") or {}).get("id"),
+                }
+                print("IG COMMENT (TEST):", json.dumps(item, ensure_ascii=False))
+                enriched.append(item)
+                return
+
+            # Real event → enrich with Graph
+            page_token = await mint_page_token()
+
+            comment_id = val.get("id")
+            if not comment_id:
+                return
+
+            c = await get_comment_detail(comment_id, page_token)
+            media_id = (c.get("media") or {}).get("id") or val.get("media_id")
+            permalink = await get_media_permalink(media_id, page_token) if media_id else ""
+
+            item = {
+                "comment_id": c.get("id"),
+                "text": c.get("text"),
+                "username": c.get("username"),
+                "timestamp": c.get("timestamp"),
+                "like_count": c.get("like_count"),
+                "media_id": media_id,
+                "permalink": permalink,
+            }
+            print("IG COMMENT:", json.dumps(item, ensure_ascii=False))
+            enriched.append(item)
+            RECENT.append(item)
+
+        except Exception:
+            # make failures visible in Render logs
+            print("ERR handle_change:", traceback.format_exc())
 
     tasks = []
     for e in entries:
@@ -128,6 +148,7 @@ async def receive(request: Request):
         await asyncio.gather(*tasks, return_exceptions=True)
 
     return {"status": "ok", "count": len(enriched), "comments": enriched}
+
 
 # ===== Quick viewer for recent events =====
 @app.get("/instagram/last")
